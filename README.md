@@ -1,50 +1,93 @@
-# FraudMesh — Multi-Agent Insurance Fraud Detection
+# FraudNet-MAS
 
-Built on Microsoft Agent Framework (`FoundryChatClient` + `ConcurrentBuilder`).
-Four specialist agents (Policy, Payments, Broker Integrity, Claims) run in
-parallel against the same case, and a custom aggregator (`fuse_verdicts` in
-`app.py`) combines their verdicts into a single decision.
+FraudNet-MAS is a multi-agent insurance fraud detection application built with Python and Streamlit. It combines specialist policy, payment, broker, and claims checks into a single fraud risk assessment and supports a human-in-the-loop review flow for escalated cases.
 
-## Files
-- `data.py` — loads the 4 CSVs from `./data`, exposes lookup functions
-- `tools.py` — `@tool`-wrapped versions of those lookups the agents can call
-- `app.py` — builds the 4 agents, the concurrent workflow, fusion logic, and
-  a CLI entry point (`python app.py <policy_id>`)
-- `streamlit_app.py` — browser demo UI
-- `evaluate.py` — runs the full 1000-policy dataset through the system and
-  reports precision/recall/F1 against ground truth, plus a single-agent
-  baseline for comparison
-- `.env.example` — copy to `.env` and fill in your Foundry project endpoint
+## Overview
 
-## Setup
+The project analyzes a policy and runs several specialist agents to gather evidence from related records, then fuses the results into a composite decision. Cases that need manual intervention can be queued for human review, where a reviewer can approve, reject, or escalate the decision.
+
+## Current workflow
+
+1. Admin logs in to the system.
+2. Admin investigates a policy using the Policy Investigation screen.
+3. The system runs the specialist agents and produces a fraud decision and composite score.
+4. If the case needs manual review, the admin clicks the "Send to Human Review" button.
+5. The case is written to the SQLite database as a pending review item.
+6. Reviewer logs in and sees only the queued cases assigned for human review.
+7. Reviewer evaluates the case and submits a final decision.
+8. The database record is marked resolved, and the dashboard reflects the final outcome.
+
+## Role-based access
+
+- Admin: dashboard and policy investigation access
+- Reviewer: human review access only
+
+Demo credentials:
+
+- Admin: `admin` / `admin`
+- Reviewer: `reviewer` / `reviewer`
+
+## Main project files
+
+- `FraudNet-MAS/app.py` — main Streamlit app, multi-agent workflow, authentication, review queue, dashboard
+- `FraudNet-MAS/data.py` — policy, payments, broker, and claims data access
+- `FraudNet-MAS/tools.py` — lookup helpers used by agents
+- `FraudNet-MAS/fraud_decisions.db` — SQLite source of truth for queued and resolved decisions
+- `FraudNet-MAS/fraud_decisions.csv` — CSV mirror synced from the database
+- `FraudNet-MAS/streamlit_app.py` — minimal demo UI for investigation-only use
+
+## Database behavior
+
+The application stores human-review workflow records in the `decisions` table inside `fraud_decisions.db`.
+
+Fields include:
+
+- `policy_id`
+- `decision`
+- `composite_score`
+- `flagged_by`
+- `verdicts_json`
+- `summary`
+- `human_decision`
+- `reviewer_notes`
+- `review_status`
+- `created_at`
+
+The review queue loads pending records from the database using `review_status = 'pending'`, so the reviewer sees the same records that were queued by the admin.
+
+## Dashboard and review queue
+
+The dashboard shows:
+
+- recent decisions
+- pending review cases
+- resolved decisions
+- aggregate averages and agent-level fraud signal counts
+
+The human review screen displays the selected policy with supporting records and a final decision form for the reviewer.
+
+## Running the app
+
+From the project root:
+
 ```bash
-pip install -r requirements.txt
-az login                          # AzureCliCredential needs an active session
-cp .env.example .env              # then edit .env with your project details
+cd FraudNet-MAS
+python -m streamlit run app.py
 ```
 
-## Run
+If using the project virtual environment:
+
 ```bash
-python app.py POL000914           # single case, CLI output
-streamlit run streamlit_app.py    # browser demo
-python evaluate.py --limit 50     # quick evaluation sample
-python evaluate.py                # full 1000-policy evaluation (slower, costs tokens)
+cd FraudNet-MAS
+.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
-## Fusion rule (app.py: fuse_verdicts)
-- `composite_score` = average confidence across agents that flagged fraud
-- `>= 2 agents` flag with confidence `>= 0.7` → **ESCALATE**
-- exactly `1 agent` flags with confidence `>= 0.8` → **REVIEW**
-- otherwise → **APPROVE**
+## Notes
 
-This threshold is deliberately explicit rather than left to an LLM to decide,
-so it's defensible and tunable — adjust the constants in `fuse_verdicts` and
-re-run `evaluate.py` to see the precision/recall tradeoff.
+This project follows the pattern below:
 
-## Known test case
-`POL000914` is a real, fully cross-linked fraud case in the dataset (agent
-`AGT00077`): flagged for Fronting in policies, Premium Diversion + Bounced
-Cheque in payments, Expired/Suspended License in ghost broking, and Multiple
-Claims in claims. A correct run should land on **ESCALATE** with 3-4 agents
-flagging it — use this to sanity-check your Foundry connection before running
-the full evaluation.
+- AI-generated investigation results feed into a structured review record.
+- Human review records are persisted in SQLite rather than only in temporary session state.
+- Reviewer decisions update the same source record and are reflected in the dashboard.
+- CSV files are treated as a synced mirror of the database, not the primary workflow storage.
+
