@@ -33,7 +33,9 @@ CSV_PATH = PROJECT_DIR / "fraud_decisions.csv"
 
 
 def ensure_decision_store():
-    with sqlite3.connect(DB_PATH) as conn:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS decisions (
@@ -52,80 +54,23 @@ def ensure_decision_store():
             """
         )
         conn.commit()
+    finally:
+        conn.close()
 
 
-def save_decision_record(policy_id: str, result: dict, summary: str | None = None):
+def _sync_csv_from_db():
+    rows = []
+    conn = sqlite3.connect(str(DB_PATH))
     try:
-        ensure_decision_store()
-        summary_text = summary or build_human_summary(policy_id, result)
-        record = {
-            "policy_id": policy_id,
-            "decision": result.get("decision", "UNKNOWN"),
-            "composite_score": float(result.get("composite_score", 0.0)),
-            "flagged_by": json.dumps(result.get("flagged_by", [])),
-            "verdicts_json": json.dumps(result.get("verdicts", [])),
-            "summary": summary_text,
-            "human_decision": None,
-            "reviewer_notes": "",
-            "review_status": "pending",
-        }
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM decisions ORDER BY created_at DESC"
+        ).fetchall()
+    finally:
+        conn.close()
 
-        with sqlite3.connect(str(DB_PATH)) as conn:
-            # Check if record exists
-            existing = conn.execute(
-                "SELECT id FROM decisions WHERE policy_id = ? ORDER BY id DESC LIMIT 1",
-                (policy_id,),
-            ).fetchone()
-            
-            if existing is not None:
-                # Update existing record
-                conn.execute(
-                    """
-                    UPDATE decisions
-                    SET decision = ?, composite_score = ?, flagged_by = ?, verdicts_json = ?,
-                        summary = ?, human_decision = NULL, reviewer_notes = '', review_status = 'pending'
-                    WHERE id = ?
-                    """,
-                    (
-                        record["decision"],
-                        record["composite_score"],
-                        record["flagged_by"],
-                        record["verdicts_json"],
-                        record["summary"],
-                        existing[0],
-                    ),
-                )
-            else:
-                # Insert new record
-                conn.execute(
-                    """
-                    INSERT INTO decisions (
-                        policy_id, decision, composite_score, flagged_by, verdicts_json,
-                        summary, human_decision, reviewer_notes, review_status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        record["policy_id"],
-                        record["decision"],
-                        record["composite_score"],
-                        record["flagged_by"],
-                        record["verdicts_json"],
-                        record["summary"],
-                        record["human_decision"],
-                        record["reviewer_notes"],
-                        record["review_status"],
-                    ),
-                )
-            conn.commit()
-        
-        print(f"✅ DEBUG: Record saved for policy {policy_id} to {DB_PATH}")
-    except Exception as e:
-        print(f"❌ ERROR saving decision record for {policy_id}: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise
-
-    csv_header = [
+    fieldnames = [
+        "id",
         "policy_id",
         "decision",
         "composite_score",
@@ -137,100 +82,116 @@ def save_decision_record(policy_id: str, result: dict, summary: str | None = Non
         "review_status",
         "created_at",
     ]
-    csv_rows = []
-    if CSV_PATH.exists():
-        with CSV_PATH.open("r", newline="", encoding="utf-8") as csv_file:
-            csv_rows = list(csv.DictReader(csv_file))
-
-    updated = False
-    for row in csv_rows:
-        if row.get("policy_id") == policy_id:
-            row.update(
-                {
-                    "policy_id": record["policy_id"],
-                    "decision": record["decision"],
-                    "composite_score": record["composite_score"],
-                    "flagged_by": record["flagged_by"],
-                    "verdicts_json": record["verdicts_json"],
-                    "summary": record["summary"],
-                    "human_decision": record["human_decision"],
-                    "reviewer_notes": record["reviewer_notes"],
-                    "review_status": record["review_status"],
-                    "created_at": __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            )
-            updated = True
-            break
-
-    if not updated:
-        csv_rows.append(
-            {
-                "policy_id": record["policy_id"],
-                "decision": record["decision"],
-                "composite_score": record["composite_score"],
-                "flagged_by": record["flagged_by"],
-                "verdicts_json": record["verdicts_json"],
-                "summary": record["summary"],
-                "human_decision": record["human_decision"],
-                "reviewer_notes": record["reviewer_notes"],
-                "review_status": record["review_status"],
-                "created_at": __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        )
-
+    csv_rows = [dict(row) for row in rows]
     with CSV_PATH.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=csv_header)
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(csv_rows)
 
 
-def update_decision_record(policy_id: str, human_decision: str, notes: str = ""):
+def save_decision_record(policy_id: str, result: dict, summary: str | None = None):
+    if not policy_id:
+        raise ValueError("policy_id is required")
+
+    ensure_decision_store()
+    summary_text = (summary or build_human_summary(policy_id, result) or "No summary").strip()
+
+    clean_policy_id = str(policy_id).strip()
+    clean_decision = str(result.get("decision", "UNKNOWN")).upper()
+    clean_score = float(result.get("composite_score", 0.0) or 0.0)
+    clean_flagged = json.dumps(result.get("flagged_by", []) or [], ensure_ascii=False)
+    clean_verdicts = json.dumps(result.get("verdicts", []) or [], ensure_ascii=False)
+
+    conn = sqlite3.connect(str(DB_PATH))
     try:
-        ensure_decision_store()
-        with sqlite3.connect(str(DB_PATH)) as conn:
-            row = conn.execute(
-                "SELECT id FROM decisions WHERE policy_id = ? ORDER BY id DESC LIMIT 1",
-                (policy_id,),
-            ).fetchone()
-            if row is not None:
-                conn.execute(
-                    """
-                    UPDATE decisions
-                    SET human_decision = ?, reviewer_notes = ?, review_status = 'resolved'
-                    WHERE id = ?
-                    """,
-                    (human_decision, notes, row[0]),
-                )
-                conn.commit()
-                print(f"✅ DEBUG: Decision updated for policy {policy_id} in {DB_PATH}")
-            else:
-                print(f"❌ WARNING: No record found for policy {policy_id}")
-    except Exception as e:
-        print(f"❌ ERROR updating decision record for {policy_id}: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id FROM decisions WHERE policy_id = ? ORDER BY id DESC LIMIT 1",
+            (clean_policy_id,),
+        )
+        existing = cursor.fetchone()
 
-    if CSV_PATH.exists():
-        with CSV_PATH.open("r", newline="", encoding="utf-8") as csv_file:
-            rows = list(csv.DictReader(csv_file))
+        if existing is not None:
+            cursor.execute(
+                """
+                UPDATE decisions
+                SET decision = ?, composite_score = ?, flagged_by = ?, verdicts_json = ?,
+                    summary = ?, human_decision = NULL, reviewer_notes = '', review_status = 'pending',
+                    created_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    clean_decision,
+                    clean_score,
+                    clean_flagged,
+                    clean_verdicts,
+                    summary_text,
+                    existing[0],
+                ),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO decisions (
+                    policy_id, decision, composite_score, flagged_by, verdicts_json,
+                    summary, human_decision, reviewer_notes, review_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_policy_id,
+                    clean_decision,
+                    clean_score,
+                    clean_flagged,
+                    clean_verdicts,
+                    summary_text,
+                    None,
+                    "",
+                    "pending",
+                ),
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        print(f"❌ DB ERROR in save_decision_record: {exc}")
+        raise exc
+    finally:
+        conn.close()
 
-        updated_rows = []
-        for row_dict in rows:
-            if row_dict.get("policy_id") == policy_id:
-                row_dict["human_decision"] = human_decision
-                row_dict["reviewer_notes"] = notes
-                row_dict["review_status"] = "resolved"
-            updated_rows.append(row_dict)
+    _sync_csv_from_db()
+    if "human_review_queue" in st.session_state:
+        st.session_state["human_review_queue"] = []
+    ensure_review_queue(force=True)
+    return True
 
-        fieldnames = list(rows[0].keys()) if rows else [
-            "policy_id", "decision", "composite_score", "flagged_by", "verdicts_json",
-            "summary", "human_decision", "reviewer_notes", "review_status", "created_at",
-        ]
-        with CSV_PATH.open("w", newline="", encoding="utf-8") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(updated_rows)
+
+def update_decision_record(policy_id: str, human_decision: str, notes: str = ""):
+    ensure_decision_store()
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id FROM decisions WHERE policy_id = ? ORDER BY id DESC LIMIT 1",
+            (str(policy_id).strip(),),
+        )
+        row = cursor.fetchone()
+        if row is not None:
+            cursor.execute(
+                """
+                UPDATE decisions
+                SET human_decision = ?, reviewer_notes = ?, review_status = 'resolved'
+                WHERE id = ?
+                """,
+                (str(human_decision).strip(), str(notes).strip(), row[0]),
+            )
+            conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        print(f"❌ DB ERROR in update_decision_record: {exc}")
+        raise exc
+    finally:
+        conn.close()
+
+    _sync_csv_from_db()
 
 
 # ---------------------------------------------------------------------------
@@ -349,14 +310,10 @@ def build_specialist_agents(chat_client: FoundryChatClient):
 
 
 # ---------------------------------------------------------------------------
-# Fusion logic — the core design decision, kept explicit and testable
+# Fusion logic
 # ---------------------------------------------------------------------------
 def _parse_verdict(raw_text: str, agent_name_fallback: str) -> dict:
-    """Best-effort parse of a specialist agent's JSON verdict. Never raises —
-    a malformed response is treated as a non-flagging, zero-confidence verdict
-    so one bad agent response can't crash the whole investigation."""
     text = raw_text.strip()
-    # strip accidental markdown fences
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
@@ -382,10 +339,6 @@ def _parse_verdict(raw_text: str, agent_name_fallback: str) -> dict:
 
 
 def fuse_verdicts(responses: list[AgentExecutorResponse]) -> str:
-    """Aggregator passed to ConcurrentBuilder.with_aggregator(). Receives one
-    AgentExecutorResponse per specialist agent, parses each verdict, and
-    applies the fusion rule. Returns a JSON string (becomes the workflow's
-    single output message)."""
     verdicts = []
     for r in responses:
         agent_name = r.executor_id
@@ -425,8 +378,6 @@ def build_investigation_workflow(chat_client: FoundryChatClient):
 
 
 async def investigate(policy_id: str) -> dict:
-    """Run all four specialist agents concurrently against a case and return
-    the fused decision as a dict."""
     chat_client = build_chat_client()
     workflow = build_investigation_workflow(chat_client)
     result = await workflow.run(
@@ -437,11 +388,9 @@ async def investigate(policy_id: str) -> dict:
     if not outputs:
         return {"composite_score": 0.0, "decision": "ERROR", "flagged_by": [], "verdicts": []}
 
-    # the aggregator returns a plain JSON string as the workflow output
     raw = outputs[0]
     if isinstance(raw, str):
         return json.loads(raw)
-    # fallback in case the SDK wraps it in a Message/AgentResponse instead
     text = getattr(raw, "text", None) or str(raw)
     return json.loads(text)
 
@@ -463,109 +412,277 @@ async def main():
 
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin"
+REVIEWER_USERNAME = "reviewer"
+REVIEWER_PASSWORD = "reviewer"
+VALID_LOGIN_PAIRS = {
+    ADMIN_USERNAME: ADMIN_PASSWORD,
+    REVIEWER_USERNAME: REVIEWER_PASSWORD,
+}
+
+
+def is_valid_login(username: str | None, password: str | None) -> bool:
+    if not username or not password:
+        return False
+    username = username.strip()
+    return VALID_LOGIN_PAIRS.get(username) == password
+
+
+def get_role_for_user(username: str | None) -> str | None:
+    if not username:
+        return None
+    username = username.strip()
+    if username == ADMIN_USERNAME:
+        return "admin"
+    if username == REVIEWER_USERNAME:
+        return "reviewer"
+    return None
 
 
 def _get_theme_settings():
-    theme_name = st.session_state.get("app_theme", "Dark")
-    if theme_name == "Custom":
-        bg = st.session_state.get("theme_bg", "#f4f7fb")
-        panel = st.session_state.get("theme_panel", "#ffffff")
-        card = st.session_state.get("theme_card", "#f0f4f9")
-        text = st.session_state.get("theme_text", "#102030")
-        accent = st.session_state.get("theme_accent", "#2f74ff")
-    elif theme_name == "Light":
-        bg = "#f4f7fb"
-        panel = "#ffffff"
-        card = "#edf3fb"
-        text = "#102030"
-        accent = "#2f74ff"
-    else:
-        bg = "#0b1220"
-        panel = "#111c2d"
-        card = "#16253d"
-        text = "#eaf2ff"
-        accent = "#5dade2"
-
-    return {
-        "bg": bg,
-        "panel": panel,
-        "card": card,
-        "muted": "#5b6d87" if text == "#102030" else "#98a9c4",
-        "text": text,
-        "green": "#2ecc71",
-        "red": "#e74c3c",
-        "amber": "#f39c12",
-        "blue": accent,
-    }
+    theme_name = st.session_state.get("app_theme", "Slate Enterprise")
+    if theme_name == "Corporate Light":
+        return {
+            "bg": "#F8FAFC",
+            "panel": "#FFFFFF",
+            "card": "#FFFFFF",
+            "card_border": "#E2E8F0",
+            "muted": "#64748B",
+            "text": "#0F172A",
+            "heading": "#0F172A",
+            "accent": "#2563EB",
+            "green": "#059669",
+            "green_bg": "#ECFDF5",
+            "red": "#DC2626",
+            "red_bg": "#FEF2F2",
+            "amber": "#D97706",
+            "amber_bg": "#FFFBEB",
+        }
+    elif theme_name == "Custom":
+        bg = st.session_state.get("theme_bg", "#0B0F17")
+        panel = st.session_state.get("theme_panel", "#111827")
+        card = st.session_state.get("theme_card", "#1F2937")
+        text = st.session_state.get("theme_text", "#F9FAFB")
+        accent = st.session_state.get("theme_accent", "#3B82F6")
+        return {
+            "bg": bg,
+            "panel": panel,
+            "card": card,
+            "card_border": "rgba(255,255,255,0.08)",
+            "muted": "#94A3B8",
+            "text": text,
+            "heading": "#FFFFFF",
+            "accent": accent,
+            "green": "#10B981",
+            "green_bg": "rgba(16, 185, 129, 0.12)",
+            "red": "#EF4444",
+            "red_bg": "rgba(239, 68, 68, 0.12)",
+            "amber": "#F59E0B",
+            "amber_bg": "rgba(245, 158, 11, 0.12)",
+        }
+    else:  # Slate Enterprise (Dark Default)
+        return {
+            "bg": "#0B0F17",
+            "panel": "#111827",
+            "card": "#161F30",
+            "card_border": "#1F293D",
+            "muted": "#94A3B8",
+            "text": "#E2E8F0",
+            "heading": "#F8FAFC",
+            "accent": "#3B82F6",
+            "green": "#10B981",
+            "green_bg": "rgba(16, 185, 129, 0.12)",
+            "red": "#EF4444",
+            "red_bg": "rgba(239, 68, 68, 0.12)",
+            "amber": "#F59E0B",
+            "amber_bg": "rgba(245, 158, 11, 0.12)",
+        }
 
 
 def apply_app_styles():
-    theme = _get_theme_settings()
+    t = _get_theme_settings()
     st.markdown(
         f"""
         <style>
-            :root {{
-                --bg: {theme['bg']};
-                --panel: {theme['panel']};
-                --card: {theme['card']};
-                --muted: {theme['muted']};
-                --text: {theme['text']};
-                --green: {theme['green']};
-                --red: {theme['red']};
-                --amber: {theme['amber']};
-                --blue: {theme['blue']};
+            @import url('[https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap](https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap)');
+
+            html, body, [class*="css"] {{
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             }}
+
+            :root {{
+                --bg: {t['bg']};
+                --panel: {t['panel']};
+                --card: {t['card']};
+                --card-border: {t['card_border']};
+                --muted: {t['muted']};
+                --text: {t['text']};
+                --heading: {t['heading']};
+                --accent: {t['accent']};
+                --green: {t['green']};
+                --green-bg: {t['green_bg']};
+                --red: {t['red']};
+                --red-bg: {t['red_bg']};
+                --amber: {t['amber']};
+                --amber-bg: {t['amber_bg']};
+            }}
+
             .stApp {{
-                background: linear-gradient(135deg, var(--bg) 0%, color-mix(in srgb, var(--bg) 80%, white) 40%, var(--card) 100%);
+                background-color: var(--bg);
                 color: var(--text);
             }}
-            .stSidebar {{
-                background: var(--panel);
-                border-right: 1px solid rgba(255,255,255,0.08);
+
+            /* Hide Streamlit Deploy button and standard header actions */
+            .stDeployButton,
+            div[data-testid="stToolbarActions"],
+            div[data-testid="stStatusWidget"],
+            #MainMenu {{
+                display: none !important;
+                visibility: hidden !important;
             }}
-            .css-1d391kg, .css-18ni7ap {{
-                background: transparent;
+
+            header[data-testid="stHeader"] {{
+                display: none !important;
             }}
-            .stDataFrame, .stTable {{
-                background: var(--card);
-                border-radius: 10px;
+
+            .block-container {{
+                padding-top: 2rem !important;
+                padding-bottom: 2rem !important;
+                max-width: 1240px;
             }}
-            .metric-container {{
-                background: var(--card);
-                border: 1px solid rgba(255,255,255,0.06);
-                border-radius: 12px;
-                padding: 0.8rem;
+
+            /* Sidebar Styling */
+            section[data-testid="stSidebar"] {{
+                background-color: var(--panel) !important;
+                border-right: 1px solid var(--card-border) !important;
             }}
-            .summary-card {{
-                background: var(--card);
-                border: 1px solid rgba(255,255,255,0.06);
-                border-radius: 12px;
-                padding: 1rem;
-                margin-top: 0.75rem;
+            section[data-testid="stSidebar"] h1, 
+            section[data-testid="stSidebar"] h2, 
+            section[data-testid="stSidebar"] h3 {{
+                color: var(--heading) !important;
+                font-weight: 700;
+                letter-spacing: -0.02em;
             }}
+
+            /* Enterprise Metric Containers */
             div[data-testid="stMetric"] {{
-                background: var(--card);
-                border: 1px solid rgba(255,255,255,0.06);
-                border-radius: 12px;
-                padding: 0.9rem;
+                background-color: var(--card) !important;
+                border: 1px solid var(--card-border) !important;
+                border-radius: 8px !important;
+                padding: 1.1rem 1.25rem !important;
+                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
             }}
-            h1, h2, h3, h4, p, label, .st-emotion-cache-10trblm, .st-emotion-cache-1inwzcr {{
-                color: var(--text) !important;
+            div[data-testid="stMetric"] label {{
+                color: var(--muted) !important;
+                font-size: 0.8125rem !important;
+                font-weight: 500 !important;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
             }}
-            .stTextInput > div > div > input,
-            .stTextInput input,
-            .stSelectbox select,
-            .stButton > button {{
-                border-radius: 10px;
+            div[data-testid="stMetric"] div[data-testid="stMetricValue"] {{
+                color: var(--heading) !important;
+                font-weight: 700 !important;
+                font-size: 1.75rem !important;
             }}
-            .stButton > button {{
-                background: linear-gradient(90deg, var(--blue), color-mix(in srgb, var(--blue) 75%, white));
-                color: white;
-                border: none;
+
+            /* Custom Enterprise Cards */
+            .ent-card {{
+                background-color: var(--card);
+                border: 1px solid var(--card-border);
+                border-radius: 8px;
+                padding: 1.25rem 1.5rem;
+                margin-top: 0.75rem;
+                margin-bottom: 1.25rem;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+            }}
+
+            .ent-header {{
+                font-size: 0.75rem;
                 font-weight: 600;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                color: var(--muted);
+                margin-bottom: 0.35rem;
+            }}
+
+            /* Badges & Status Pills */
+            .ent-pill {{
+                display: inline-flex;
+                align-items: center;
+                gap: 0.375rem;
+                padding: 0.25rem 0.625rem;
+                font-size: 0.75rem;
+                font-weight: 600;
+                border-radius: 9999px;
+                line-height: 1;
+            }}
+            .ent-pill-green {{
+                background-color: var(--green-bg);
+                color: var(--green);
+                border: 1px solid var(--green);
+            }}
+            .ent-pill-red {{
+                background-color: var(--red-bg);
+                color: var(--red);
+                border: 1px solid var(--red);
+            }}
+            .ent-pill-amber {{
+                background-color: var(--amber-bg);
+                color: var(--amber);
+                border: 1px solid var(--amber);
+            }}
+
+            /* Tables & DataFrames */
+            .stDataFrame, .stTable {{
+                border-radius: 8px;
+                overflow: hidden;
+                border: 1px solid var(--card-border);
+            }}
+
+            /* Forms, Inputs, and Select Boxes */
+            .stTextInput > div > div > input, 
+            .stSelectbox > div > div, 
+            .stTextArea textarea {{
+                background-color: var(--card) !important;
+                color: var(--text) !important;
+                border: 1px solid var(--card-border) !important;
+                border-radius: 6px !important;
+                font-size: 0.875rem !important;
+            }}
+            .stTextInput > div > div > input:focus,
+            .stTextArea textarea:focus {{
+                border-color: var(--accent) !important;
+                box-shadow: 0 0 0 1px var(--accent) !important;
+            }}
+
+            /* Buttons */
+            .stButton > button {{
+                background-color: var(--accent) !important;
+                color: #FFFFFF !important;
+                border: 1px solid transparent !important;
+                border-radius: 6px !important;
+                padding: 0.45rem 1rem !important;
+                font-weight: 600 !important;
+                font-size: 0.875rem !important;
+                box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+                transition: all 0.15s ease-in-out;
             }}
             .stButton > button:hover {{
-                background: linear-gradient(90deg, color-mix(in srgb, var(--blue) 85%, black), var(--blue));
+                opacity: 0.92;
+                transform: translateY(-1px);
+                box-shadow: 0 2px 4px rgba(0,0,0,0.15);
+            }}
+
+            /* Headings */
+            h1, h2, h3, h4 {{
+                color: var(--heading) !important;
+                font-weight: 700 !important;
+                letter-spacing: -0.02em !important;
+            }}
+            p, label, span {{
+                color: var(--text);
+            }}
+            .text-muted {{
+                color: var(--muted) !important;
             }}
         </style>
         """,
@@ -582,8 +699,14 @@ def _get_history():
 def get_dashboard_decision(item: dict) -> str:
     value = item.get("human_decision") or item.get("decision") or "UNKNOWN"
     value = str(value).upper()
-    if value == "ALLOW":
+    if value in {"ALLOW", "APPROVE"}:
         return "ALLOW"
+    if value in {"REJECT", "REJECTED"}:
+        return "REJECT"
+    if value == "ESCALATE":
+        return "ESCALATE"
+    if value == "REVIEW":
+        return "REVIEW"
     return value
 
 
@@ -597,20 +720,26 @@ def load_csv_decision_rows() -> list[dict]:
 
 def get_decision_store_rows() -> list[dict]:
     ensure_decision_store()
-    csv_rows = load_csv_decision_rows()
-    if csv_rows:
-        return csv_rows
-    with sqlite3.connect(str(DB_PATH)) as conn:
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM decisions ORDER BY created_at DESC"
         ).fetchall()
-    return [dict(row) for row in rows]
+        db_rows = [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+    if db_rows:
+        return db_rows
+    csv_rows = load_csv_decision_rows()
+    if csv_rows:
+        return csv_rows
+    return []
 
 
 def compute_dashboard_stats() -> dict:
-    csv_rows = load_csv_decision_rows()
-    rows = csv_rows if csv_rows else get_decision_store_rows()
+    rows = get_decision_store_rows()
     if rows:
         total_cases = len(rows)
         escalations = sum(1 for item in rows if get_dashboard_decision(item) == "ESCALATE")
@@ -709,79 +838,93 @@ def render_result(result: dict, policy_id: str | None = None):
         st.warning("No investigation result was returned.")
         return
 
-    decision = result.get("decision", "UNKNOWN")
-    composite_score = result.get("composite_score", 0.0)
+    decision = result.get("decision", "UNKNOWN").upper()
+    composite_score = float(result.get("composite_score", 0.0))
     verdicts = result.get("verdicts", [])
 
-    if policy_id:
-        st.caption(f"Policy ID: {policy_id}")
-
     human_summary = build_human_summary(policy_id or "unknown", result)
-    st.subheader("Agents summary")
-    st.write(human_summary)
 
-    st.subheader("Investigation summary")
-    col1, col2 = st.columns(2)
-    with col1:
-        if decision.upper() in {"APPROVE", "CLEAR", "ALLOW"}:
-            st.markdown(f"<h3 style='color: #2ecc71;'>Decision: {decision}</h3>", unsafe_allow_html=True)
-        else:
-            st.markdown(f"<h3 style='color: #e74c3c;'>Decision: {decision}</h3>", unsafe_allow_html=True)
-    with col2:
-        st.metric("Composite score", f"{composite_score:.2f}")
+    pill_class = "ent-pill-green" if decision in {"APPROVE", "CLEAR", "ALLOW"} else ("ent-pill-amber" if decision == "REVIEW" else "ent-pill-red")
+
+    st.markdown(
+        f"""
+        <div class="ent-card">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.75rem;">
+                <div>
+                    <div class="ent-header">INVESTIGATION OUTCOME</div>
+                    <div style="display: flex; align-items: center; gap: 0.75rem;">
+                        <h2 style="margin: 0; font-size: 1.5rem;">Policy {policy_id or '—'}</h2>
+                        <span class="ent-pill {pill_class}">{decision}</span>
+                    </div>
+                </div>
+                <div style="text-align: right;">
+                    <div class="ent-header">COMPOSITE RISK</div>
+                    <div style="font-size: 1.5rem; font-weight: 700;">{composite_score:.2f}</div>
+                </div>
+            </div>
+            <div style="font-size: 0.9375rem; line-height: 1.5; color: var(--text);">
+                {human_summary}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     if verdicts:
-        table_rows = []
-        for verdict in verdicts:
-            table_rows.append(
-                {
-                    "Agent": verdict.get("agent", "Unknown"),
-                    "Status": "Fraud" if verdict.get("fraud_flag") else "Clear",
-                    "Type": verdict.get("fraud_type") or "None",
-                    "Confidence": float(verdict.get("confidence", 0.0)),
-                    "Evidence": verdict.get("evidence", "No evidence provided"),
-                }
-            )
-
+        st.markdown("<div class='ent-header'>SPECIALIST AGENT FINDINGS</div>", unsafe_allow_html=True)
+        table_rows = [
+            {
+                "Agent": v.get("agent", "Unknown"),
+                "Status": "⚠️ Flagged" if v.get("fraud_flag") else "✓ Clear",
+                "Anomaly Type": v.get("fraud_type") or "None",
+                "Confidence": f"{float(v.get('confidence', 0.0)):.2f}",
+                "Evidence": v.get("evidence", "No evidence provided"),
+            }
+            for v in verdicts
+        ]
         st.dataframe(
             table_rows,
             use_container_width=True,
             hide_index=True,
-            column_order=["Agent", "Status", "Type", "Confidence", "Evidence"],
+            column_order=["Agent", "Status", "Anomaly Type", "Confidence", "Evidence"],
         )
     else:
         st.info("No specialist verdicts were returned.")
 
     if policy_id:
-        review_key = f"human_review_{policy_id}"
-        col1, col2 = st.columns([1, 1])
+        review_key = f"send_review_{policy_id}"
+        col1, col2 = st.columns([1, 2])
         with col1:
-            if st.button("✅ Send to Human Review", key=review_key, use_container_width=True):
-                save_decision_record(policy_id, result, human_summary)
-                add_case_to_review(policy_id, result)
-                st.session_state["last_review_summary"] = human_summary
-                st.success(f"✅ Policy {policy_id} has been saved and queued for human review!")
-                st.rerun()
+            if st.button("📋 Route to Human Review Queue", key=review_key, use_container_width=True):
+                try:
+                    save_decision_record(policy_id, result, human_summary)
+                    add_case_to_review(policy_id, result)
+                    st.session_state["last_review_summary"] = human_summary
+                    st.toast(f"Policy {policy_id} queued for review", icon="✅")
+                    st.success(f"Policy {policy_id} has been transferred to the review queue.")
+                except Exception as e:
+                    st.error(f"Failed to queue review: {e}")
 
 
 def dashboard_page():
-    st.title("Fraud dashboard")
+    st.markdown("<h2>Fraud Analytics & Operations</h2>", unsafe_allow_html=True)
+    st.markdown("<div class='text-muted' style='margin-bottom: 1.5rem;'>High-level summary of policy verifications and specialist agent fraud flags.</div>", unsafe_allow_html=True)
+
     stats = compute_dashboard_stats()
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Total cases", stats["total_cases"])
+        st.metric("Total Cases", stats["total_cases"])
     with col2:
-        st.metric("Escalate", stats["escalations"])
+        st.metric("Escalations", stats["escalations"])
     with col3:
-        st.metric("Review", stats["reviews"])
+        st.metric("Pending Review", stats["reviews"])
     with col4:
-        st.metric("Approve", stats["approvals"])
+        st.metric("Approved", stats["approvals"])
 
-    st.caption(f"Average score: {stats['avg_score']:.2f}")
+    st.caption(f"Portfolio Average Composite Score: {stats['avg_score']:.2f}")
 
-    # Tabs for different views
-    tab1, tab2 = st.tabs(["Recent Decisions", "Pending Reviews"])
+    tab1, tab2, tab3 = st.tabs(["Recent Activity", "Review Backlog", "Resolved Audit Log"])
 
     with tab1:
         store_rows = get_decision_store_rows()
@@ -791,71 +934,103 @@ def dashboard_page():
                 ai_decision = item.get("decision", "UNKNOWN")
                 human_decision = item.get("human_decision") or "—"
                 review_status = item.get("review_status", "pending")
-                
-                # Show human decision if available, otherwise show AI decision
                 final_decision = human_decision if human_decision != "—" else ai_decision
-                
+
                 recent_rows.append(
                     {
                         "Policy ID": item.get("policy_id", "--"),
                         "AI Decision": ai_decision,
-                        "Final Decision": final_decision,
-                        "Score": float(item.get("composite_score", 0.0)),
-                        "Status": "✅ Resolved" if review_status == "resolved" else "⏳ Pending",
+                        "Final Outcome": final_decision,
+                        "Composite Risk": f"{float(item.get('composite_score', 0.0)):.2f}",
+                        "Workflow Status": "Resolved" if review_status == "resolved" else "Pending Review",
                     }
                 )
             st.dataframe(recent_rows, use_container_width=True, hide_index=True)
         else:
-            st.info("Recent investigation history will appear here as soon as you run a case.")
+            st.info("No investigation activity recorded yet. Run a policy evaluation to populate metrics.")
 
     with tab2:
         store_rows = get_decision_store_rows()
         pending_rows = [item for item in store_rows if item.get("review_status") == "pending"]
-        
+
         if pending_rows:
             pending_table = []
             for item in pending_rows:
                 pending_table.append(
                     {
                         "Policy ID": item.get("policy_id", "--"),
-                        "AI Decision": item.get("decision", "UNKNOWN"),
-                        "Score": float(item.get("composite_score", 0.0)),
-                        "Summary": item.get("summary", "No summary")[:80] + "..." if item.get("summary") else "—",
+                        "AI Determination": item.get("decision", "UNKNOWN"),
+                        "Risk Score": f"{float(item.get('composite_score', 0.0)):.2f}",
+                        "Summary": item.get("summary", "No summary")[:90] + "..." if item.get("summary") else "—",
                     }
                 )
             st.dataframe(pending_table, use_container_width=True, hide_index=True)
         else:
-            st.info("No pending reviews. All cases have been resolved!")
+            st.info("The review queue is empty. All policies have been evaluated.")
+
+    with tab3:
+        store_rows = get_decision_store_rows()
+        resolved_rows = [item for item in store_rows if item.get("review_status") == "resolved"]
+
+        if resolved_rows:
+            resolved_table = []
+            for item in resolved_rows:
+                resolved_table.append(
+                    {
+                        "Policy ID": item.get("policy_id", "--"),
+                        "AI Verdict": item.get("decision", "UNKNOWN"),
+                        "Sign-off Decision": item.get("human_decision", "—"),
+                        "Auditor Notes": (item.get("reviewer_notes") or "—")[:90],
+                        "Risk Score": f"{float(item.get('composite_score', 0.0)):.2f}",
+                    }
+                )
+            st.dataframe(resolved_table, use_container_width=True, hide_index=True)
+        else:
+            st.info("No resolved determinations present in the audit log.")
 
     if stats.get("agent_counts"):
-        st.subheader("Fraud signals by agent")
-        agent_df = [{"Agent": k, "Fraud signals": v} for k, v in stats["agent_counts"].items()]
+        st.markdown("<br><div class='ent-header'>SPECIALIST AGENT DETECTION FREQUENCY</div>", unsafe_allow_html=True)
+        agent_df = [{"Specialist Unit": k, "Detections Triggered": v} for k, v in stats["agent_counts"].items()]
         st.dataframe(agent_df, use_container_width=True, hide_index=True)
-    else:
-        st.info("No agent fraud signals recorded yet. Run an investigation to populate this dashboard.")
 
 
 def ensure_review_queue(force: bool = False):
     if "human_review_queue" not in st.session_state or st.session_state["human_review_queue"] is None:
         st.session_state["human_review_queue"] = []
 
-    if force:
+    if force or True:
         queued = []
         ensure_decision_store()
-        with sqlite3.connect(str(DB_PATH)) as conn:
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT policy_id, decision, composite_score, flagged_by, verdicts_json, summary, human_decision, reviewer_notes, review_status FROM decisions WHERE review_status = 'pending' ORDER BY created_at DESC"
+                """
+                SELECT policy_id, decision, composite_score, flagged_by, verdicts_json, summary,
+                       human_decision, reviewer_notes, review_status
+                FROM decisions
+                WHERE review_status IS NULL OR review_status = 'pending'
+                ORDER BY created_at DESC
+                """
             ).fetchall()
+        finally:
+            conn.close()
 
         for row in rows:
-            verdicts = json.loads(row["verdicts_json"] or "[]")
+            try:
+                verdicts = json.loads(row["verdicts_json"] or "[]")
+            except Exception:
+                verdicts = []
+            try:
+                flagged_by = json.loads(row["flagged_by"] or "[]")
+            except Exception:
+                flagged_by = []
             queued.append(
                 {
                     "policy_id": row["policy_id"],
                     "decision": row["decision"],
                     "composite_score": float(row["composite_score"] or 0.0),
-                    "flagged_by": json.loads(row["flagged_by"] or "[]"),
+                    "flagged_by": flagged_by,
                     "verdicts": verdicts,
                     "human_decision": row["human_decision"],
                     "notes": row["reviewer_notes"] or "",
@@ -867,7 +1042,7 @@ def ensure_review_queue(force: bool = False):
             with CSV_PATH.open("r", newline="", encoding="utf-8") as csv_file:
                 csv_rows = list(csv.DictReader(csv_file))
             for row in csv_rows:
-                if row.get("review_status") == "pending":
+                if row.get("review_status") in (None, "", "pending"):
                     verdicts = json.loads(row.get("verdicts_json") or "[]")
                     queued.append(
                         {
@@ -886,160 +1061,152 @@ def ensure_review_queue(force: bool = False):
 
 
 def add_case_to_review(policy_id: str, result: dict):
-    # Reload from database to get the latest
     ensure_review_queue(force=True)
-    
     queue = st.session_state["human_review_queue"]
-    # Check if this policy is already in the queue
     if not any(item["policy_id"] == policy_id for item in queue):
-        # Don't add manually, let the database be the source of truth
         pass
-    
-    # Always reload from DB after any changes
     ensure_review_queue(force=True)
 
 
 def human_review_page():
-    # Always reload from database to ensure we have the latest pending records
+    if not st.session_state.get("authenticated", False):
+        st.warning("Please sign in to access the Human Review workspace.")
+        login_page()
+        return
+
+    role = st.session_state.get("role")
+    if role != "reviewer":
+        st.warning("Access restricted: Reviewer authorization required.")
+        st.session_state["authenticated"] = False
+        st.session_state.pop("username", None)
+        st.session_state.pop("role", None)
+        login_page()
+        return
+
     ensure_review_queue(force=True)
-    st.title("Human in the loop review")
-    st.subheader("Insurance agent final decision")
+    st.markdown("<h2>Human-in-the-Loop Review Station</h2>", unsafe_allow_html=True)
+    st.markdown("<div class='text-muted' style='margin-bottom: 1.5rem;'>Examine automated multi-agent determinations and submit binding human approvals or rejections.</div>", unsafe_allow_html=True)
 
     queue = st.session_state["human_review_queue"]
-    
-    # Show status
+
     col1, col2 = st.columns([1, 3])
     with col1:
-        st.metric("Cases Queued", len(queue))
+        st.metric("Pending Adjudications", len(queue))
     with col2:
         if len(queue) > 0:
-            st.success(f"✅ {len(queue)} case(s) awaiting your review")
+            st.info(f"⚡ {len(queue)} policy case(s) waiting for operational decision.")
         else:
-            st.info("No pending cases")
-    
-    # Debug: Show database path and record count
-    with st.expander("🔧 Debug Info", expanded=False):
-        st.write(f"**Database Path:** `{DB_PATH}`")
-        st.write(f"**Database Exists:** {DB_PATH.exists()}")
+            st.success("All assigned cases have been processed.")
+
+    with st.expander("System Audit & Storage Info", expanded=False):
+        st.caption(f"Store Location: `{DB_PATH}`")
         try:
-            with sqlite3.connect(str(DB_PATH)) as conn:
+            conn = sqlite3.connect(str(DB_PATH))
+            try:
                 total_records = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
                 pending_records = conn.execute("SELECT COUNT(*) FROM decisions WHERE review_status='pending'").fetchone()[0]
                 resolved_records = conn.execute("SELECT COUNT(*) FROM decisions WHERE review_status='resolved'").fetchone()[0]
-            st.write(f"**Total Records in DB:** {total_records}")
-            st.write(f"**Pending:** {pending_records} | **Resolved:** {resolved_records}")
-            
-            # Show all records
-            with sqlite3.connect(str(DB_PATH)) as conn:
-                conn.row_factory = sqlite3.Row
-                all_rows = conn.execute("SELECT policy_id, decision, review_status, created_at FROM decisions ORDER BY created_at DESC LIMIT 20").fetchall()
-            if all_rows:
-                st.write("**Recent Records:**")
-                for row in all_rows:
-                    st.write(f"  - {row['policy_id']}: {row['decision']} ({row['review_status']}) - {row['created_at']}")
+            finally:
+                conn.close()
+
+            st.write(f"**Total Records:** {total_records} | **Pending:** {pending_records} | **Resolved:** {resolved_records}")
         except Exception as e:
             st.error(f"Error reading database: {str(e)}")
-    
+
     if not queue:
-        st.warning("No cases are currently queued for human review.")
-        st.info("**How to queue a case:**\n1. Go to 'Policy Investigation'\n2. Enter a Policy ID\n3. Click 'Investigate policy'\n4. Review the results\n5. Click '✅ Send to Human Review'")
+        st.info("No policy records currently requiring human intervention.")
         return
 
-    selected_policy = st.selectbox("Select policy for review", [item["policy_id"] for item in queue])
+    selected_policy = st.selectbox("Select Target Policy", [item["policy_id"] for item in queue])
     case = next(item for item in queue if item["policy_id"] == selected_policy)
 
+    dec_val = case['decision'].upper()
+    pill_class = "ent-pill-green" if dec_val in {"APPROVE", "CLEAR", "ALLOW"} else ("ent-pill-amber" if dec_val == "REVIEW" else "ent-pill-red")
+
     st.markdown(
-        f"<div class='summary-card'><strong>Policy:</strong> {case['policy_id']}<br>"
-        f"<strong>AI decision:</strong> {case['decision']}<br>"
-        f"<strong>Composite score:</strong> {float(case['composite_score']):.2f}<br>"
-        f"<strong>Recommendation:</strong> {case.get('summary', '')}</div>",
+        f"""
+        <div class="ent-card">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                <span class="ent-header">CASE OVERVIEW &bull; {case['policy_id']}</span>
+                <span class="ent-pill {pill_class}">{dec_val}</span>
+            </div>
+            <div style="font-size: 0.9375rem; line-height: 1.5;">
+                {case.get('summary', 'No overview generated.')}
+            </div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
-    st.subheader("Case summary")
-    st.write(case.get("summary", "No summary available."))
-
-    # Fetch and display related policy data
     policy_data = data.get_policy_record(selected_policy)
     if policy_data:
-        with st.expander("📋 Policy Details", expanded=True):
+        with st.expander("Policy Metadata Details", expanded=True):
             col1, col2 = st.columns(2)
             with col1:
                 st.write(f"**Policy ID:** {policy_data.get('policy_id', 'N/A')}")
-                st.write(f"**Insured Name:** {policy_data.get('insured_name', 'N/A')}")
-                st.write(f"**Issue Date:** {policy_data.get('issue_date', 'N/A')}")
-                st.write(f"**Premium:** {policy_data.get('premium', 'N/A')}")
-                st.write(f"**Sum Insured:** {policy_data.get('sum_insured', 'N/A')}")
+                st.write(f"**Insured Entity:** {policy_data.get('insured_name', 'N/A')}")
+                st.write(f"**Effective Date:** {policy_data.get('issue_date', 'N/A')}")
+                st.write(f"**Total Premium:** {policy_data.get('premium', 'N/A')}")
             with col2:
-                st.write(f"**Status:** {policy_data.get('policy_status', 'N/A')}")
-                st.write(f"**Channel:** {policy_data.get('channel', 'N/A')}")
-                st.write(f"**State:** {policy_data.get('state', 'N/A')}")
-                st.write(f"**Agent ID:** {policy_data.get('agent_id', 'N/A')}")
-                st.write(f"**Fraud Flag (Ground Truth):** {'Yes' if policy_data.get('fraud_flag') else 'No'}")
+                st.write(f"**Policy Status:** {policy_data.get('policy_status', 'N/A')}")
+                st.write(f"**Underwriting Channel:** {policy_data.get('channel', 'N/A')}")
+                st.write(f"**State / Region:** {policy_data.get('state', 'N/A')}")
+                st.write(f"**Agent Reference:** {policy_data.get('agent_id', 'N/A')}")
 
-    # Fetch and display payment records
     payment_records = data.get_payment_records(selected_policy)
     if payment_records:
-        with st.expander("💳 Payment Records", expanded=False):
+        with st.expander("Transaction & Premium Ledgers", expanded=False):
             payment_table = []
             for payment in payment_records:
                 payment_table.append({
-                    "Payment ID": payment.get("payment_id", "N/A"),
+                    "Payment Ref": payment.get("payment_id", "N/A"),
                     "Amount": payment.get("amount", 0),
-                    "Status": payment.get("payment_status", "N/A"),
-                    "Remitted to Insurer": payment.get("premium_remitted_to_insurer", False),
-                    "Delay Days": payment.get("remittance_delay_days", 0),
+                    "Clearing Status": payment.get("payment_status", "N/A"),
+                    "Remitted to Insurer": "Yes" if payment.get("premium_remitted_to_insurer") else "No",
+                    "Delay (Days)": payment.get("remittance_delay_days", 0),
                 })
             st.dataframe(payment_table, use_container_width=True, hide_index=True)
-    else:
-        with st.expander("💳 Payment Records", expanded=False):
-            st.info("No payment records found for this policy.")
 
-    # Fetch and display claim records
     claim_records = data.get_claim_records(selected_policy)
     if claim_records:
-        with st.expander("📄 Claims History", expanded=False):
+        with st.expander("Claims History & Adjudication", expanded=False):
             claim_table = []
             for claim in claim_records:
                 claim_table.append({
-                    "Claim ID": claim.get("claim_id", "N/A"),
-                    "Claim Amount": claim.get("claim_amount", 0),
+                    "Claim Ref": claim.get("claim_id", "N/A"),
+                    "Claimed Value": claim.get("claim_amount", 0),
                     "Approved Amount": claim.get("approved_amount", 0),
                     "Status": claim.get("claim_status", "N/A"),
-                    "Days to Incident": claim.get("days_policy_to_incident", 0),
+                    "Policy-to-Incident (Days)": claim.get("days_policy_to_incident", 0),
                 })
             st.dataframe(claim_table, use_container_width=True, hide_index=True)
-    else:
-        with st.expander("📄 Claims History", expanded=False):
-            st.info("No claims found for this policy.")
 
-    # Fetch and display broker/agent integrity info
     agent_id = data.get_agent_id_for_policy(selected_policy)
     if agent_id:
         broker_records = data.get_ghost_broking_records(agent_id)
         if broker_records:
-            with st.expander("🔍 Broker Integrity Info", expanded=False):
+            with st.expander("Broker Integrity & Regulatory Clearance", expanded=False):
                 broker_table = []
                 for broker in broker_records:
                     broker_table.append({
-                        "Agent ID": broker.get("agent_id", "N/A"),
-                        "License Status": broker.get("license_status", "N/A"),
-                        "Complaints": broker.get("complaint_count", 0),
-                        "Premium Deposited": broker.get("premium_deposited_with_insurer", False),
-                        "Customer Aware": broker.get("customer_aware_of_agent_status", False),
+                        "Agent Ref": broker.get("agent_id", "N/A"),
+                        "License Health": broker.get("license_status", "N/A"),
+                        "Complaints Recorded": broker.get("complaint_count", 0),
+                        "Premium Deposited": "Yes" if broker.get("premium_deposited_with_insurer") else "No",
+                        "Customer Aware": "Yes" if broker.get("customer_aware_of_agent_status") else "No",
                     })
                 st.dataframe(broker_table, use_container_width=True, hide_index=True)
 
     if case.get("verdicts"):
-        st.subheader("Agent evidence table")
+        st.markdown("<br><div class='ent-header'>SPECIALIST AGENT FINDINGS</div>", unsafe_allow_html=True)
         st.dataframe(
             [
                 {
                     "Agent": v.get("agent", "Unknown"),
-                    "Status": "Fraud" if v.get("fraud_flag") else "Clear",
-                    "Type": v.get("fraud_type") or "None",
-                    "Confidence": float(v.get("confidence", 0.0)),
-                    "Evidence": v.get("evidence", "No evidence provided"),
+                    "Status": "⚠️ Flagged" if v.get("fraud_flag") else "✓ Clear",
+                    "Pattern Identified": v.get("fraud_type") or "None",
+                    "Confidence": f"{float(v.get('confidence', 0.0)):.2f}",
+                    "Audit Evidence": v.get("evidence", "No evidence provided"),
                 }
                 for v in case["verdicts"]
             ],
@@ -1047,17 +1214,23 @@ def human_review_page():
             hide_index=True,
         )
 
-    st.divider()
-    st.subheader("Your Final Decision")
+    st.markdown("<hr style='border: none; border-top: 1px solid var(--card-border); margin: 2rem 0 1rem 0;'>", unsafe_allow_html=True)
+    st.markdown("<h3>Adjudication Verdict</h3>", unsafe_allow_html=True)
     decision = st.radio(
-        "Select action",
+        "Final Decision",
         ["ALLOW", "REJECT", "REVIEW", "ESCALATE"],
         index=0,
         horizontal=True,
+        format_func=lambda value: {
+            "ALLOW": "Approve Policy",
+            "REJECT": "Reject & Flag",
+            "REVIEW": "Escalate to Field",
+            "ESCALATE": "Refer to SIU",
+        }.get(value, value),
     )
-    notes = st.text_area("Reviewer notes", value=case.get("notes", ""), height=100)
+    notes = st.text_area("Audit Justification / Notes", value=case.get("notes", ""), placeholder="Enter operational justification for this decision...", height=100)
 
-    if st.button("✅ Submit final decision", use_container_width=True):
+    if st.button("Commit Final Determination", use_container_width=True):
         update_decision_record(selected_policy, decision, notes)
         for item in queue:
             if item["policy_id"] == selected_policy:
@@ -1065,55 +1238,68 @@ def human_review_page():
                 item["notes"] = notes
                 break
         st.session_state["human_review_queue"] = [item for item in queue if item["policy_id"] != selected_policy]
-        st.success(f"✅ Final decision saved for policy {selected_policy}: **{decision}**")
+        st.success(f"Determination committed for policy {selected_policy}: {decision}")
         st.rerun()
-
-    st.divider()
-    st.subheader("Queued review list")
-    review_table = []
-    for item in queue:
-        review_table.append(
-            {
-                "Policy ID": item["policy_id"],
-                "AI Decision": item["decision"],
-                "Score": float(item.get("composite_score", 0.0)),
-                "Human Decision": item.get("human_decision") or "⏳ Pending",
-            }
-        )
-    st.dataframe(review_table, use_container_width=True, hide_index=True)
 
 
 def login_page():
-    st.title("FraudNet MAS")
-    st.subheader("Login")
+    st.markdown(
+        """
+        <div style="text-align: center; margin-top: 2.5rem; margin-bottom: 2rem;">
+            <h1 style="font-size: 2.25rem; font-weight: 800; letter-spacing: -0.03em; margin-bottom: 0.25rem;">FraudNet MAS</h1>
+            <p class="text-muted" style="font-size: 0.9375rem; margin-top: 0;">Enterprise Multi-Agent Insurance Fraud Detection Platform</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
+    col1, col2, col3 = st.columns([1, 1.3, 1])
+    with col2:
+        with st.container(border=True):
+            st.markdown("<div class='ent-header' style='margin-bottom: 1rem;'>SECURE SIGN IN</div>", unsafe_allow_html=True)
+            username = st.text_input("Username", placeholder="admin or reviewer")
+            password = st.text_input("Password", type="password", placeholder="••••••••")
 
-    if st.button("Login"):
-        if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-            st.session_state["authenticated"] = True
-            st.session_state["username"] = username
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
+            st.markdown("<div style='margin-top: 0.5rem;'></div>", unsafe_allow_html=True)
+            if st.button("Sign In", use_container_width=True):
+                if is_valid_login(username, password):
+                    username = username.strip()
+                    st.session_state["authenticated"] = True
+                    st.session_state["username"] = username
+                    st.session_state["role"] = get_role_for_user(username)
+                    st.rerun()
+                else:
+                    st.session_state["authenticated"] = False
+                    st.session_state.pop("username", None)
+                    st.session_state.pop("role", None)
+                    st.error("Invalid credentials. Demo accounts: admin/admin, reviewer/reviewer")
 
 
 def policy_search_page():
-    st.title("FraudNet MAS")
-    st.caption(f"Logged in as: {st.session_state.get('username', 'admin')}")
+    st.markdown("<h2>Policy Fraud Investigation</h2>", unsafe_allow_html=True)
+    st.markdown("<div class='text-muted' style='margin-bottom: 1.5rem;'>Trigger concurrent verification across policy, payment, ghost-broking, and claims detection agents.</div>", unsafe_allow_html=True)
 
-    policy_id = st.text_input("Policy ID", placeholder="POL000914")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        policy_id = st.text_input("Target Policy Identifier", value="POL000914", label_visibility="collapsed")
+    with col2:
+        run_btn = st.button("Run Inspection", use_container_width=True)
 
-    if st.button("Investigate policy") and policy_id.strip():
-        with st.spinner(f"Investigating policy {policy_id}..."):
-            result = asyncio.run(investigate(policy_id.strip()))
+    if run_btn and policy_id.strip():
+        pid = policy_id.strip()
+        with st.spinner(f"Orchestrating specialist agents for policy {pid}..."):
+            result = asyncio.run(investigate(pid))
+
+        st.session_state["current_investigation"] = {
+            "policy_id": pid,
+            "result": result,
+        }
 
         history = _get_history()
         history.insert(
             0,
             {
-                "policy_id": policy_id.strip(),
+                "policy_id": pid,
                 "decision": result.get("decision", "UNKNOWN"),
                 "composite_score": result.get("composite_score", 0.0),
                 "flagged_by": result.get("flagged_by", []),
@@ -1123,69 +1309,96 @@ def policy_search_page():
         if len(history) > 10:
             history.pop()
 
-        render_result(result, policy_id.strip())
+    current = st.session_state.get("current_investigation")
+    if current:
+        render_result(current["result"], current["policy_id"])
     else:
-        st.info("Enter a policy ID and click 'Investigate policy' to review the fraud risk assessment.")
+        st.info("Specify a policy ID and select 'Run Inspection' to execute multi-agent analysis.")
 
 
 def streamlit_app():
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
+    if "username" not in st.session_state:
+        st.session_state["username"] = ""
+    if "role" not in st.session_state:
+        st.session_state["role"] = None
 
     if "investigation_history" not in st.session_state:
         st.session_state["investigation_history"] = []
 
-    if "app_theme" not in st.session_state:
-        st.session_state["app_theme"] = "Dark"
-    if "theme_bg" not in st.session_state:
-        st.session_state["theme_bg"] = "#f4f7fb"
-    if "theme_panel" not in st.session_state:
-        st.session_state["theme_panel"] = "#ffffff"
-    if "theme_card" not in st.session_state:
-        st.session_state["theme_card"] = "#edf3fb"
-    if "theme_text" not in st.session_state:
-        st.session_state["theme_text"] = "#102030"
-    if "theme_accent" not in st.session_state:
-        st.session_state["theme_accent"] = "#2f74ff"
+    if st.session_state.get("authenticated"):
+        current_user = str(st.session_state.get("username", "")).strip()
+        expected_role = get_role_for_user(current_user)
+        if expected_role is None:
+            st.session_state["authenticated"] = False
+            st.session_state.pop("username", None)
+            st.session_state.pop("role", None)
+        else:
+            st.session_state["role"] = expected_role
 
-    ensure_review_queue()
+    if "app_theme" not in st.session_state:
+        st.session_state["app_theme"] = "Slate Enterprise"
+
+    apply_app_styles()
 
     if not st.session_state["authenticated"]:
-        apply_app_styles()
         login_page()
         return
 
-    st.sidebar.title("FraudNet MAS")
+    # Sidebar setup
+    st.sidebar.markdown(
+        """
+        <div style="padding-bottom: 1rem; border-bottom: 1px solid rgba(255,255,255,0.08); margin-bottom: 1rem;">
+            <div style="font-size: 1.125rem; font-weight: 800; letter-spacing: -0.02em;">FraudNet MAS</div>
+            <div style="font-size: 0.75rem; color: #94A3B8; text-transform: uppercase; letter-spacing: 0.06em;">Enterprise Edition</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.session_state["app_theme"] = st.sidebar.selectbox(
-        "Theme",
-        ["Dark", "Light", "Custom"],
-        index=["Dark", "Light", "Custom"].index(st.session_state.get("app_theme", "Dark")),
+        "Theme Palette",
+        ["Slate Enterprise", "Corporate Light", "Custom"],
+        index=["Slate Enterprise", "Corporate Light", "Custom"].index(st.session_state.get("app_theme", "Slate Enterprise")),
     )
     if st.session_state["app_theme"] == "Custom":
-        st.session_state["theme_bg"] = st.sidebar.color_picker("Background", st.session_state.get("theme_bg", "#f4f7fb"))
-        st.session_state["theme_panel"] = st.sidebar.color_picker("Sidebar", st.session_state.get("theme_panel", "#ffffff"))
-        st.session_state["theme_card"] = st.sidebar.color_picker("Cards", st.session_state.get("theme_card", "#edf3fb"))
-        st.session_state["theme_text"] = st.sidebar.color_picker("Text", st.session_state.get("theme_text", "#102030"))
-        st.session_state["theme_accent"] = st.sidebar.color_picker("Accent", st.session_state.get("theme_accent", "#2f74ff"))
+        st.session_state["theme_bg"] = st.sidebar.color_picker("Background", st.session_state.get("theme_bg", "#0B0F17"))
+        st.session_state["theme_panel"] = st.sidebar.color_picker("Sidebar", st.session_state.get("theme_panel", "#111827"))
+        st.session_state["theme_card"] = st.sidebar.color_picker("Cards", st.session_state.get("theme_card", "#1F2937"))
+        st.session_state["theme_text"] = st.sidebar.color_picker("Text", st.session_state.get("theme_text", "#F9FAFB"))
+        st.session_state["theme_accent"] = st.sidebar.color_picker("Accent", st.session_state.get("theme_accent", "#3B82F6"))
     apply_app_styles()
-    st.sidebar.caption(f"Queued for review: {len(st.session_state['human_review_queue'])}")
-    page = st.sidebar.radio(
-        "Navigation",
-        ["Dashboard", "Policy Investigation", "Human Review"],
-        index=1,
-    )
 
-    if st.sidebar.button("Logout"):
+    role = st.session_state.get("role")
+    st.sidebar.markdown(f"<div style='font-size: 0.8125rem; margin-top: 1rem;'><span style='color: var(--muted);'>User:</span> <strong>{st.session_state.get('username')}</strong> ({role})</div>", unsafe_allow_html=True)
+
+    if st.sidebar.button("Sign Out"):
         st.session_state["authenticated"] = False
         st.session_state.pop("username", None)
+        st.session_state.pop("role", None)
+        st.session_state.pop("current_investigation", None)
         st.rerun()
 
-    if page == "Dashboard":
-        dashboard_page()
-    elif page == "Human Review":
+    st.sidebar.markdown("<hr style='border: none; border-top: 1px solid var(--card-border); margin: 1rem 0;'>", unsafe_allow_html=True)
+
+    if role == "admin":
+        page = st.sidebar.radio("Navigation", ["Dashboard", "Policy Investigation"], index=1)
+        if page == "Dashboard":
+            dashboard_page()
+        else:
+            policy_search_page()
+        return
+
+    if role == "reviewer":
+        ensure_review_queue(force=True)
         human_review_page()
-    else:
-        policy_search_page()
+        return
+
+    st.session_state["authenticated"] = False
+    st.session_state.pop("username", None)
+    st.session_state.pop("role", None)
+    login_page()
 
 
 if __name__ == "__main__":
